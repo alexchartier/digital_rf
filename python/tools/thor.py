@@ -31,6 +31,10 @@ from gnuradio import blocks
 from gnuradio import filter as grfilter
 from gnuradio import gr, uhd
 
+import shutil
+import freq_stepper
+import pdb
+
 
 def equiripple_lpf(cutoff=0.9, transition_width=0.2, attenuation=80, pass_ripple=None):
     """Get taps for an equiripple low-pass filter.
@@ -526,6 +530,9 @@ class Thor(object):
                 sys.stdout.write("locked\n")
                 sys.stdout.flush()
 
+        # Set the time from GPS 
+        freq_stepper.set_dev_time(u)
+
         # set global options
         # sample rate (set after clock rate so it can be calculated correctly)
         u.set_samp_rate(float(op.samplerate))
@@ -550,8 +557,14 @@ class Thor(object):
         # set per-channel options
         # set command time so settings are synced
         COMMAND_DELAY = 0.2
-        cmd_time = u.get_time_now() + uhd.time_spec(COMMAND_DELAY)
-        u.set_command_time(cmd_time, uhd.ALL_MBOARDS)
+        gpstime = datetime.utcfromtimestamp(u.get_mboard_sensor("gps_time"))
+        gpstime_secs = (pytz.utc.localize(gpstime) - drf.util.epoch).total_seconds()
+        cmd_time_secs = gpstime_secs + COMMAND_DELAY
+
+        u.set_command_time(
+            uhd.time_spec(float(cmd_time_secs)),
+            uhd.ALL_MBOARDS,
+        )
         for ch_num in range(op.nrchs):
             # local oscillator sharing settings
             lo_source = op.lo_sources[ch_num]
@@ -794,6 +807,22 @@ class Thor(object):
         if not os.path.isdir(op.datadir):
             os.makedirs(op.datadir)
 
+        # Copy freq_list into the data directory
+        if op.freq_list_fname:
+            for ch in op.channel_names:
+                chdir = os.path.join(op.datadir,  ch)
+                try:
+                    os.makedirs(chdir)
+                except:
+                    None
+                try:
+                    shutil.copy2(
+                        op.freq_list_fname, 
+                        os.path.join(chdir, 'freq_list.txt')
+                    )
+                except:
+                    None
+
         # wait for the start time if it is not past
         while (st is not None) and (
             (st - pytz.utc.localize(datetime.utcnow())) > timedelta(seconds=SETUP_TIME)
@@ -824,24 +853,6 @@ class Thor(object):
             time.sleep(0.5)
             u.stop()
             time.sleep(0.2)
-
-        # set device time
-        tt = time.time()
-        if op.time_sync:
-            # wait until time 0.2 to 0.5 past full second, then latch
-            # we have to trust NTP to be 0.2 s accurate
-            while tt - math.floor(tt) < 0.2 or tt - math.floor(tt) > 0.3:
-                time.sleep(0.01)
-                tt = time.time()
-            if op.verbose:
-                print("Latching at " + str(tt))
-            # waits for the next pps to happen
-            # (at time math.ceil(tt))
-            # then sets the time for the subsequent pps
-            # (at time math.ceil(tt) + 1.0)
-            u.set_time_unknown_pps(uhd.time_spec(math.ceil(tt) + 1.0))
-        else:
-            u.set_time_now(uhd.time_spec(tt), uhd.ALL_MBOARDS)
 
         # set launch time
         # (at least 2 seconds out so USRP start time can be set properly and
@@ -1089,6 +1100,17 @@ class Thor(object):
                 errstr = "No samples streamed after launch. Exiting with failure."
                 raise RuntimeError(errstr)
             time.sleep(1)
+
+        if op.freq_list_fname:
+            # Step through freqs
+            basedir ='/'.join(op.freq_list_fname.split('/')[:-2]) 
+            lock_fname = os.path.join(basedir, 'logs/gps_lock.log')
+
+            freq_stepper.step(
+                usrp, op, 
+                freq_list_fname=op.freq_list_fname,
+                lock_fname=lock_fname,
+            )
 
         # wait until end time or until flowgraph stops
         if et is None and duration is not None:
@@ -1604,6 +1626,16 @@ def _add_drf_group(parser):
 def _add_time_group(parser):
     timegroup = parser.add_argument_group(title="time")
     timegroup.add_argument(
+        '-fl', '--freq_list', dest='freq_list.txt',
+        help='''Text file with list of tune times in format:
+        time (in seconds of each minute): frequency (in MHz), e.g.:
+        0:   3
+        15:  6
+        30:  9
+        45:  12
+        (default: None)''',
+    )   
+    timegroup.add_argument(
         "-s",
         "--starttime",
         dest="starttime",
@@ -1696,6 +1728,10 @@ def _build_thor_parser(Parser, *args):
     egs = [
         """\
         {0} -m 192.168.20.2 -d "A:A A:B" -c h,v -f 95e6 -r 100e6/24
+        /data/test
+        """,
+        """\
+        {0} -m 192.168.20.2 -d "A:A A:B" -c h,v -fl freq_list.txt -r 100e6/24
         /data/test
         """,
         """\
